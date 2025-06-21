@@ -40,7 +40,7 @@ sudo -u postgres psql -p 5433 -c "CREATE USER postgres WITH PASSWORD '5g';"
 sudo -u postgres psql -p 5433 -c "GRANT ALL ON DATABASE probuzhdenie TO postgres;"
 5.Создать .env и заполнить по примеру env_example.py/
 6.Применить миграции:запустить файл storage.migrator.(важно)
-6.Запустить python run_bot.py
+7.Запустить python run_bot.py
 
 
 Регистрация новых компонентов:

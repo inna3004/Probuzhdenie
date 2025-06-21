@@ -98,21 +98,61 @@ class UserRepository(BaseRepository):
                 return None
 
     def complete_registration(self, user_id: int) -> bool:
-        """Завершить регистрацию пользователя"""
+        """Завершение регистрации с обработкой рефералов"""
         with self.storage.connection() as conn:
             cursor = conn.cursor()
             try:
-                cursor.execute(
-                    """UPDATE users SET registration_complete = TRUE, 
-                    current_level = 1, current_state = %s 
-                    WHERE id = %s""",
-                    (BotStates.MAIN_MENU, user_id)
-                )
+                # 1. Обновляем статус регистрации пользователя
+                cursor.execute("""
+                    UPDATE users 
+                    SET registration_complete = TRUE, 
+                        current_state = %s 
+                    WHERE id = %s
+                    RETURNING id
+                """, (BotStates.MAIN_MENU, user_id))
+
+                if not cursor.fetchone():
+                    return False
+
+                # 2. Получаем и обновляем реферальные связи
+                cursor.execute("""
+                    WITH updated_refs AS (
+                        UPDATE referrals
+                        SET registration_date = NOW()
+                        WHERE referee_id = %s 
+                        AND registration_date IS NULL
+                        RETURNING referrer_id, level
+                    )
+                    SELECT referrer_id, level FROM updated_refs
+                """, (user_id,))
+
+                updated_referrals = cursor.fetchall()
+
+                # 3. Создаем задания для рефереров
+                for referrer_id, level in updated_referrals:
+                    cursor.execute("""
+                        INSERT INTO tasks (
+                            user_id, level, task_type,
+                            start_time, end_time, completed
+                        ) VALUES (
+                            %s, %s, 'referral',
+                            NOW(), NOW(), TRUE
+                        )
+                        ON CONFLICT (user_id, level, task_type) 
+                        DO UPDATE SET 
+                            completed = EXCLUDED.completed,
+                            end_time = EXCLUDED.end_time
+                        WHERE NOT tasks.completed
+                    """, (referrer_id, level))
+
+                    logger.info(f"Реферал обработан: {referrer_id}->{user_id} уровень {level}")
+
                 conn.commit()
-                return cursor.rowcount > 0
+                return True
+
             except Exception as e:
-                logger.error(f"Error completing registration for user {user_id}: {e}")
                 conn.rollback()
+                logger.error(f"Ошибка завершения регистрации: {str(e)}", exc_info=True)
                 return False
 
     def update_user_level(self, user_id: int, level: int, force: bool = False) -> bool:
@@ -147,6 +187,8 @@ class UserRepository(BaseRepository):
                 logger.error(f"Error updating level for user {user_id}: {e}")
                 conn.rollback()
                 return False
+
+
 # Класс UserDataRepository
 # Работает с дополнительными данными пользователей (user_data):
 # Основные методы:
@@ -268,13 +310,21 @@ class TaskRepository(BaseRepository):
                 cursor.execute(
                     """INSERT INTO tasks 
                     (user_id, level, task_type, start_time, end_time, completed) 
-                    VALUES (%s, %s, %s, %s, %s, %s)""",
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (user_id, level, task_type) DO NOTHING""",
                     (user_id, level, task_type, start_time, end_time, completed)
                 )
                 conn.commit()
-                return cursor.rowcount > 0
+
+                if cursor.rowcount > 0:
+                    logger.info(f"Task created: user_id={user_id}, level={level}, type={task_type}")
+                    return True
+                else:
+                    logger.warning(f"Task already exists: user_id={user_id}, level={level}, type={task_type}")
+                    return False
+
             except Exception as e:
-                logger.error(f"Error creating task: {e}")
+                logger.error(f"Error creating task: {str(e)}")
                 conn.rollback()
                 return False
 
@@ -429,82 +479,129 @@ def is_task_completed_for_level(self, user_id: int, level: int) -> bool:
 # create_referral(referrer_id, referee_id) - создает реферальную связь
 # get_referral_status(user_id, level) - получает статус рефералов пользователя
 class ReferralRepository(BaseRepository):
-    def create_referral(self, referrer_id: int, referee_id: int) -> bool:
-        """Создать реферальную связь с проверкой на дубликаты"""
-        with self.storage.connection() as conn:
-            cursor = conn.cursor()
-            try:
-                # Проверяем существование referrer
+    def create_referral(self, referrer_id: int, referee_id: int, level: int) -> bool:
+        """Создание реферальной связи с гарантированной записью"""
+        try:
+            with self.storage.connection() as conn:
+                cursor = conn.cursor()
+
+                # Явная проверка существования пользователей
                 cursor.execute("SELECT 1 FROM users WHERE id = %s", (referrer_id,))
                 if not cursor.fetchone():
+                    logger.error(f"Реферер {referrer_id} не существует")
                     return False
 
-                # Проверяем существование referee (даже если регистрация не завершена)
                 cursor.execute("SELECT 1 FROM users WHERE id = %s", (referee_id,))
                 if not cursor.fetchone():
-                    # Создаем пользователя если его нет
+                    logger.info(f"Создаем пользователя {referee_id}")
                     cursor.execute(
                         "INSERT INTO users (id) VALUES (%s) ON CONFLICT DO NOTHING",
                         (referee_id,)
                     )
-                    conn.commit()
 
-                # Проверяем существование записи
-                cursor.execute(
-                    "SELECT 1 FROM referrals WHERE referrer_id = %s AND referee_id = %s",
-                    (referrer_id, referee_id)
-                )
+                # Принудительное создание связи
+                cursor.execute("""
+                    INSERT INTO referrals (referrer_id, referee_id, level)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (referrer_id, referee_id, level) 
+                    DO UPDATE SET registration_date = NOW()
+                    RETURNING id
+                """, (referrer_id, referee_id, level))
+
                 if cursor.fetchone():
-                    return False
+                    conn.commit()
+                    logger.info(f"Реферальная связь установлена: {referrer_id}->{referee_id} уровень {level}")
+                    return True
 
-                cursor.execute(
-                    """INSERT INTO referrals 
-                    (referrer_id, referee_id, registration_date) 
-                    VALUES (%s, %s, NULL)""",
-                    (referrer_id, referee_id)
-                )
-                conn.commit()
-                return True
-            except Exception as e:
-                logger.error(f"Error creating referral {referrer_id}->{referee_id}: {e}")
                 conn.rollback()
                 return False
 
-    def get_referral_status(self, user_id: int, level: int) -> dict:
-        """Получить статус рефералов для пользователя и уровня"""
-        try:
-            with self.storage.connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        SELECT COUNT(*) FROM referrals
-                        WHERE referrer_id = %s
-                    """, (user_id,))
-                    total = cursor.fetchone()[0]
-
-                    cursor.execute("""
-                        SELECT COUNT(*) FROM referrals r
-                        JOIN users u ON r.referee_id = u.id
-                        WHERE r.referrer_id = %s
-                        AND u.registration_complete = TRUE
-                        AND r.registration_date IS NOT NULL
-                    """, (user_id,))
-                    completed = cursor.fetchone()[0]
-
-                    return {
-                        'total_referrals': total,
-                        'completed_referrals': completed,
-                        'pending_referrals': total - completed,
-                        'error': None
-                    }
         except Exception as e:
-            logger.error(f"Error in get_referral_status: {str(e)}")
+            logger.error(f"Критическая ошибка создания реферала: {str(e)}", exc_info=True)
+            return False
+
+    def get_completed_referrals_count(self, referrer_id: int, level: int) -> int:
+        """Новый метод: Получить количество завершенных рефералов для уровня"""
+        with self.storage.connection() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute("""
+                    SELECT COUNT(*) FROM referrals r
+                    JOIN users u ON r.referee_id = u.id
+                    WHERE r.referrer_id = %s 
+                    AND r.level = %s
+                    AND u.registration_complete = TRUE
+                """, (referrer_id, level))
+                return cursor.fetchone()[0]
+            except Exception as e:
+                logger.error(f"Ошибка подсчета рефералов: {str(e)}")
+                return 0
+
+    def complete_referral_task(self, user_id: int, level: int) -> bool:
+        """Завершение реферального задания с использованием нового метода"""
+        logger.info(f"Попытка завершения реферального задания: user_id={user_id}, level={level}")
+
+        # Используем новый метод для проверки
+        completed_refs = self.get_completed_referrals_count(user_id, level)
+        if completed_refs == 0:
+            logger.warning(f"Нет завершенных рефералов для user_id={user_id}, level={level}")
+            return False
+
+        with self.storage.connection() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute("""
+                    INSERT INTO tasks (
+                        user_id, level, task_type, 
+                        start_time, end_time, completed
+                    ) VALUES (
+                        %s, %s, 'referral', 
+                        NOW(), NOW(), TRUE
+                    )
+                    ON CONFLICT (user_id, level, task_type) 
+                    DO UPDATE SET 
+                        completed = EXCLUDED.completed,
+                        end_time = EXCLUDED.end_time
+                    WHERE NOT tasks.completed
+                    RETURNING id
+                """, (user_id, level))
+
+                conn.commit()
+                return cursor.fetchone() is not None
+
+            except Exception as e:
+                conn.rollback()
+                logger.error(f"Ошибка завершения задания: {str(e)}", exc_info=True)
+                return False
+
+    def get_referral_status(self, user_id: int, level: int) -> dict:
+        """Получить статус рефералов с использованием нового метода"""
+        try:
+            completed = self.get_completed_referrals_count(user_id, level)
+
+            with self.storage.connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT COUNT(*) FROM referrals
+                    WHERE referrer_id = %s AND level = %s
+                """, (user_id, level))
+                total = cursor.fetchone()[0]
+
+            return {
+                'total_referrals': total,
+                'completed_referrals': completed,
+                'pending_referrals': total - completed,
+                'error': None
+            }
+
+        except Exception as e:
+            logger.error(f"Ошибка проверки статуса: {str(e)}")
             return {
                 'total_referrals': 0,
                 'completed_referrals': 0,
                 'pending_referrals': 0,
                 'error': str(e)
             }
-
 
 # Класс DonationRepository
 # Работает с донатами (donations):

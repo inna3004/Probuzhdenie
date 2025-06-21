@@ -24,3 +24,5 @@ class BotStates:
     REFERRAL_TASK = 9
     DONATION_TASK = 10
     FINAL_LEVEL = 11
+    CHARITY_AMOUNT_INPUT = 12
+    FAQ = 13

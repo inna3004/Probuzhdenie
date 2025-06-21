@@ -4,20 +4,6 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-# Класс Migrator
-# Отвечает за создание и обновление структуры базы данных.
-# Основные функции:
-#     Создает все необходимые таблицы при первом запуске
-#     Создает индексы для ускорения запросов
-#     Добавляет триггеры для автоматической обработки событий
-#     Заполняет таблицу уровней начальными данными
-# Таблицы:
-#     users - основная информация о пользователях
-#     user_data - дополнительные данные пользователей
-#     levels - контент и правила уровней
-#     tasks - задания пользователей
-#     referrals - реферальные связи
-#     donations - информация о донатах
 class Migrator:
     def __init__(self, storage: PostgresStorage):
         self.storage = storage
@@ -28,12 +14,17 @@ class Migrator:
             with self.storage.connection() as conn:
                 cursor = conn.cursor()
 
+                # 1. Очистка дубликатов
+                self._clean_duplicates(cursor, conn)
+
+                # 2. Создание таблиц
                 base_queries = [
                     """
                     CREATE TABLE IF NOT EXISTS users (
                         id BIGINT PRIMARY KEY,
                         registration_complete BOOLEAN NOT NULL DEFAULT FALSE,
-                        current_level INTEGER NOT NULL DEFAULT 1,
+                        current_level INTEGER NOT NULL DEFAULT 1 
+                            CHECK (current_level >= 1 AND current_level <= 21),
                         current_state INTEGER NOT NULL DEFAULT 0,
                         registration_date TIMESTAMP DEFAULT NOW()
                     )
@@ -45,12 +36,14 @@ class Migrator:
                         birthdate TEXT,
                         location TEXT,
                         language TEXT DEFAULT 'ru',
-                        viewed_level INTEGER DEFAULT 1  # <- Новое поле
+                        viewed_level INTEGER DEFAULT 1 
+                            CHECK (viewed_level >= 1 AND viewed_level <= 21)
                     )
                     """,
                     """
                     CREATE TABLE IF NOT EXISTS levels (
-                        level_number INTEGER PRIMARY KEY,
+                        level_number INTEGER PRIMARY KEY 
+                            CHECK (level_number >= 1 AND level_number <= 21),
                         content TEXT NOT NULL,
                         rules TEXT
                     )
@@ -58,151 +51,235 @@ class Migrator:
                     """
                     CREATE TABLE IF NOT EXISTS tasks (
                         id SERIAL PRIMARY KEY,
-                        user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
-                        level INTEGER NOT NULL,
-                        task_type TEXT NOT NULL,
+                        user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        level INTEGER NOT NULL 
+                            CHECK (level >= 1 AND level <= 21),
+                        task_type TEXT NOT NULL 
+                            CHECK (task_type IN ('time', 'referral', 'donation', 'auto')),
                         start_time TIMESTAMP NOT NULL,
                         end_time TIMESTAMP NOT NULL,
                         completed BOOLEAN NOT NULL DEFAULT FALSE,
-                        completion_time TIMESTAMP
+                        completion_time TIMESTAMP,
+                        CONSTRAINT tasks_unique UNIQUE (user_id, level, task_type),
+                        CONSTRAINT valid_task_times CHECK (end_time >= start_time)
                     )
                     """,
                     """
                     CREATE TABLE IF NOT EXISTS referrals (
                         id SERIAL PRIMARY KEY,
-                        referrer_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
-                        referee_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+                        referrer_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        referee_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        level INTEGER NOT NULL 
+                            CHECK (level >= 1 AND level <= 21),
+                        referral_date TIMESTAMP DEFAULT NOW(),
                         registration_date TIMESTAMP,
-                        UNIQUE (referrer_id, referee_id)
+                        CONSTRAINT referrals_unique UNIQUE (referrer_id, referee_id, level),
+                        CONSTRAINT no_self_referral CHECK (referrer_id != referee_id)
                     )
                     """,
                     """
                     CREATE TABLE IF NOT EXISTS donations (
                         id SERIAL PRIMARY KEY,
-                        user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
-                        level INTEGER NOT NULL,
-                        amount DECIMAL(10, 2) NOT NULL,
+                        user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        level INTEGER NOT NULL 
+                            CHECK (level >= 1 AND level <= 21),
+                        amount DECIMAL(10, 2) NOT NULL 
+                            CHECK (amount > 0),
                         currency TEXT NOT NULL,
                         status TEXT NOT NULL,
                         donation_date TIMESTAMP NOT NULL,
-                        payment_id TEXT
+                        payment_id TEXT,
+                        processed BOOLEAN DEFAULT FALSE
                     )
-                    """,
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_tasks_user_level ON tasks(user_id, level)
-                    """,
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)
-                    """,
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_referrals_referee ON referrals(referee_id)
-                    """,
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_donations_user_level ON donations(user_id, level)
-                    """,
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_donations_user_level ON donations(user_id, level) 
-                        WHERE status = 'succeeded'
                     """
                 ]
 
-                additional_indexes = [
-                    """CREATE INDEX IF NOT EXISTS idx_tasks_user_completed 
-                       ON tasks(user_id, level, completed)""",
-                    """CREATE INDEX IF NOT EXISTS idx_tasks_completion 
-                       ON tasks(completed, completion_time)"""
+                for query in base_queries:
+                    cursor.execute(query)
+                    conn.commit()
+
+                # 3. Создание индексов
+                index_queries = [
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_user_level ON tasks(user_id, level)",
+                    "CREATE INDEX IF NOT EXISTS idx_referrals_referrer_level ON referrals(referrer_id, level)",
+                    "CREATE INDEX IF NOT EXISTS idx_referrals_referee_level ON referrals(referee_id, level)",
+                    "CREATE INDEX IF NOT EXISTS idx_referrals_level ON referrals(level)",
+                    "CREATE INDEX IF NOT EXISTS idx_donations_user_level ON donations(user_id, level)",
+                    """CREATE INDEX IF NOT EXISTS idx_donations_user_level_succeeded 
+                       ON donations(user_id, level) WHERE status = 'succeeded'""",
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_user_completed ON tasks(user_id, level, completed)",
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_completion ON tasks(completed, completion_time)",
+                    "CREATE INDEX IF NOT EXISTS idx_user_data_viewed_level ON user_data(viewed_level)",
+                    "CREATE INDEX IF NOT EXISTS idx_user_data_composite ON user_data(user_id, viewed_level)",
+                    "CREATE INDEX IF NOT EXISTS idx_referrals_registration ON referrals(registration_date)",
+                    "CREATE INDEX IF NOT EXISTS idx_users_registration ON users(registration_complete)",
+                    "CREATE INDEX IF NOT EXISTS idx_donations_payment_id ON donations(payment_id) WHERE payment_id "
+                    "IS NOT NULL",
                 ]
 
-                new_indexes = [
-                    """CREATE INDEX IF NOT EXISTS idx_user_data_viewed_level 
-                       ON user_data(viewed_level)""",
-                    """CREATE INDEX IF NOT EXISTS idx_user_data_composite 
-                       ON user_data(user_id, viewed_level)"""
-                ]
-                for query in base_queries + additional_indexes + new_indexes:
-                    try:
-                        logger.info(f"Executing query: {query[:100]}...")
-                        cursor.execute(query)
-                        conn.commit()
-                        logger.info(f"Query executed successfully: {query[:100]}...")
-                    except Exception as e:
-                        logger.error(f"Ошибка выполнения запроса: {str(e)}")
-                        logger.error(f"Failed query: {query}")
-                        conn.rollback()
-                        continue
+                for query in index_queries:
+                    cursor.execute(query)
+                    conn.commit()
 
-                trigger_queries = [
-                """
-                   CREATE OR REPLACE FUNCTION process_referral_registration()
-                RETURNS TRIGGER AS $$
-                DECLARE
-                    referrer_id BIGINT;
-                BEGIN
-                    -- Если регистрация завершена и это изменение статуса
-                    IF NEW.registration_complete = TRUE AND 
-                       (OLD.registration_complete IS DISTINCT FROM NEW.registration_complete) THEN
-                        
-                        -- Находим referrer_id для этого пользователя (даже если запись была создана после первого входа)
-                        SELECT r.referrer_id INTO referrer_id 
-                        FROM referrals r 
-                        WHERE r.referee_id = NEW.id
-                        ORDER BY r.id DESC  -- Берем самую свежую запись
-                        LIMIT 1;
-                        
-                        IF referrer_id IS NOT NULL THEN
-                            -- Обновляем дату регистрации, если она NULL
-                            UPDATE referrals 
-                            SET registration_date = NEW.registration_date
-                            WHERE referee_id = NEW.id AND registration_date IS NULL;
-                            
-                            -- Создаем задание для реферера
+                # 4. Удаление старого триггера (если существует)
+                cursor.execute("""
+                    DROP TRIGGER IF EXISTS after_user_registration ON users
+                """)
+                conn.commit()
+
+                # 5. Создание улучшенной триггерной функции
+                cursor.execute("""
+                    CREATE OR REPLACE FUNCTION process_referral_registration()
+                    RETURNS TRIGGER AS $$
+                    DECLARE
+                        updated_referrals INT;
+                        inserted_tasks INT;
+                    BEGIN
+                        -- Обновляем реферальные записи
+                        UPDATE referrals 
+                        SET registration_date = NOW()
+                        WHERE referee_id = NEW.id 
+                        AND registration_date IS NULL;
+
+                        GET DIAGNOSTICS updated_referrals = ROW_COUNT;
+
+                        -- Если есть обновленные рефералы, создаем/обновляем задачи
+                        IF updated_referrals > 0 THEN
+                            -- Вставка или обновление существующих задач
                             INSERT INTO tasks (
                                 user_id, level, task_type, 
-                                start_time, end_time, completed
-                            ) VALUES (
-                                referrer_id, 
-                                (SELECT current_level FROM users WHERE id = referrer_id),
-                                'referral',
-                                NOW(),
-                                NOW(),
-                                TRUE
-                            );
-                        END IF;
-                    END IF;
-                    RETURN NEW;
-                END;
-                $$ LANGUAGE plpgsql;
-                """
-                ]
-
-                for query in trigger_queries:
-                    try:
-                        cursor.execute(query)
-                        conn.commit()
-                        logger.info("Триггер успешно создан/обновлен")
-                    except Exception as e:
-                        logger.error(f"Ошибка создания триггера: {str(e)}")
-                        conn.rollback()
-                        continue
-
-                try:
-                    cursor.execute("SELECT 1 FROM levels LIMIT 1")
-                    if not cursor.fetchone():
-                        for level in range(1, 22):
-                            cursor.execute(
-                                "INSERT INTO levels (level_number, content, rules) VALUES (%s, %s, %s)",
-                                (level, f"Контент для уровня {level}", f"Правила уровня {level}")
+                                start_time, end_time, completed,
+                                completion_time
                             )
-                        conn.commit()
-                except Exception as e:
-                    logger.error(f"Ошибка заполнения уровней: {str(e)}")
-                    conn.rollback()
+                            SELECT 
+                                r.referrer_id, 
+                                r.level, 
+                                'referral', 
+                                NOW(), 
+                                NOW(), 
+                                TRUE,
+                                NOW()
+                            FROM referrals r
+                            WHERE r.referee_id = NEW.id
+                            AND r.registration_date IS NOT NULL
+                            ON CONFLICT (user_id, level, task_type) 
+                            DO UPDATE SET
+                                completed = EXCLUDED.completed,
+                                completion_time = EXCLUDED.completion_time,
+                                end_time = EXCLUDED.end_time;
 
-                logger.info("Миграции PostgreSQL выполнены успешно")
+                            GET DIAGNOSTICS inserted_tasks = ROW_COUNT;
+
+                            -- Логирование в системную таблицу
+                            INSERT INTO audit_log (event_type, user_id, message)
+                            VALUES ('referral_processed', NEW.id, 
+                                'Processed ' || inserted_tasks || ' referral tasks');
+                        END IF;
+
+                        RETURN NEW;
+                    END;
+                    $$ LANGUAGE plpgsql;
+                """)
+                conn.commit()
+
+                # 6. Создание триггера
+                cursor.execute("""
+                    CREATE TRIGGER after_user_registration
+                    AFTER UPDATE OF registration_complete ON users
+                    FOR EACH ROW
+                    WHEN (NEW.registration_complete IS TRUE AND 
+                         (OLD.registration_complete IS FALSE OR OLD.registration_complete IS NULL))
+                    EXECUTE FUNCTION process_referral_registration();
+                """)
+                conn.commit()
+
+                # 7. Создание таблицы для логов (если не существует)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS audit_log (
+                        id SERIAL PRIMARY KEY,
+                        event_time TIMESTAMP DEFAULT NOW(),
+                        event_type TEXT NOT NULL,
+                        user_id BIGINT,
+                        message TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_audit_log_event_type ON audit_log(event_type);
+                    CREATE INDEX IF NOT EXISTS idx_audit_log_user_id ON audit_log(user_id);
+                """)
+                conn.commit()
+
+                # 8. Исправление "зависших" реферальных заданий
+                cursor.execute("""
+                    UPDATE tasks t
+                    SET 
+                        completed = TRUE,
+                        completion_time = NOW(),
+                        end_time = NOW()
+                    FROM referrals r
+                    WHERE 
+                        t.user_id = r.referrer_id
+                        AND t.level = r.level
+                        AND t.task_type = 'referral'
+                        AND r.registration_date IS NOT NULL
+                        AND t.completed = FALSE;
+                """)
+                conn.commit()
+
+                logger.info("Все миграции успешно выполнены")
 
         except Exception as e:
-            logger.error(f"Критическая ошибка при выполнении миграций: {str(e)}")
+            logger.error(f"Ошибка при выполнении миграций: {str(e)}", exc_info=True)
             raise
+
+    def _clean_duplicates(self, cursor, conn):
+        """Очистка дубликатов в основных таблицах"""
+        try:
+            logger.info("Очистка возможных дубликатов в таблице tasks...")
+            cursor.execute("""
+                DELETE FROM tasks 
+                WHERE ctid NOT IN (
+                    SELECT min(ctid) 
+                    FROM tasks 
+                    GROUP BY user_id, level, task_type
+                )
+            """)
+            conn.commit()
+
+            logger.info("Очистка возможных дубликатов в таблице referrals...")
+            cursor.execute("""
+                DELETE FROM referrals 
+                WHERE ctid NOT IN (
+                    SELECT min(ctid) 
+                    FROM referrals 
+                    GROUP BY referrer_id, referee_id, level
+                )
+            """)
+            conn.commit()
+
+            logger.info("Очистка дубликатов завершена")
+        except Exception as e:
+            logger.warning(f"Не удалось очистить дубликаты: {str(e)}")
+            conn.rollback()
+
+    def _verify_data_integrity(self, cursor, conn):
+        """Базовая проверка целостности данных"""
+        try:
+            logger.info("Проверка целостности данных...")
+
+            # Проверка рефералов с несуществующими пользователями
+            cursor.execute("""
+                SELECT COUNT(*) FROM referrals r
+                LEFT JOIN users u1 ON r.referrer_id = u1.id
+                LEFT JOIN users u2 ON r.referee_id = u2.id
+                WHERE u1.id IS NULL OR u2.id IS NULL
+            """)
+            invalid_referrals = cursor.fetchone()[0]
+            if invalid_referrals > 0:
+                logger.warning(f"Найдены невалидные реферальные связи: {invalid_referrals}")
+
+            logger.info("Проверка целостности данных завершена")
+        except Exception as e:
+            logger.error(f"Ошибка при проверке целостности данных: {str(e)}")
+            conn.rollback()
 
 
 if __name__ == "__main__":

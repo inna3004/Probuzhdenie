@@ -1,3 +1,4 @@
+import os
 import logging
 from pathlib import Path
 import threading
@@ -236,33 +237,29 @@ def show_level_content(message, level_number):
         user_id = message.from_user.id
         user_data_repo.set_viewed_level(user_id, level_number)
         user = user_repo.get_user(user_id)
+
+        # Проверка, что пользователь не пытается перейти на уровень выше текущего
         if user and user.get('current_level') < level_number:
             logger.warning(
                 f"User {user_id} trying to view level {level_number} beyond current {user.get('current_level')}")
             level_number = user.get('current_level')
+
+        # Получаем контент и правила уровня
         level_content = level_repo.get_level_content(level_number)
-        logger.info(f"[Level Content] Level content: {level_content[:50]}...")
+        level_rules = level_repo.get_level_rules(level_number)
+
+        # Логирование информации о уровне
+        logger.info(f"[Level {level_number}] Content length: {len(level_content) if level_content else 0}")
+        logger.info(f"[Level {level_number}] Rules content: {level_rules[:50] + '...' if level_rules else 'None'}")
 
         if not level_content:
-            logger.warning(f"[Level Content] No content found for level {level_number}")
-            bot.send_message(
-                message.chat.id,
-                "Контент для этого уровня пока недоступен."
-            )
+            logger.warning(f"[Level {level_number}] No content found")
+            bot.send_message(message.chat.id, "Контент для этого уровня пока недоступен.")
             return
 
-        user = user_repo.get_user(user_id)
-        current_level = user.get('current_level', 1)
-        logger.info(f"[Level Content] User's current level in DB: {current_level}")
-
-        is_completed = (task_repo.is_task_completed(user_id, current_level, 'time') or
-                        task_repo.is_task_completed(user_id, current_level, 'referral') or
-                        task_repo.is_task_completed(user_id, current_level, 'donation'))
-        logger.info(f"[Level Content] Task completion status: {is_completed}")
-
-        keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-
+        # Подготовка клавиатуры в зависимости от уровня
         if level_number == 1:
+            keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
             keyboard.add(
                 types.KeyboardButton("Ответы на вопросы"),
                 types.KeyboardButton("Далее")
@@ -273,19 +270,101 @@ def show_level_content(message, level_number):
                 user_id=user_id,
                 task_repo=task_repo
             )
-            logger.info(f"[Level Content] Created navigation keyboard for level {level_number}")
 
-        bot.send_message(
-            message.chat.id,
-            level_content,
-            reply_markup=keyboard
-        )
+        # Отправка текстового контента уровня
+        bot.send_message(message.chat.id, level_content, reply_markup=keyboard)
 
+        # Обработка изображения, если указано в rules
+        if level_rules and level_rules.startswith("image:"):
+            try:
+                import os
+                from pathlib import Path
+
+                # Получаем относительный путь из БД
+                image_relative = level_rules.replace("image:", "").strip()
+
+                # Все возможные пути к папке с изображениями
+                possible_paths = [
+                    # Windows пути
+                    Path(r"C:\projects\1bot_probuzhdenie\static\levels"),
+                    Path(r"C:\1bot_probuzhdenie\static\levels"),
+                    Path(r"C:\static\levels"),
+                    Path(r"C:\app\static\levels"),
+
+                    # Linux пути
+                    Path("/var/www/1bot_probuzhdenie/static/levels"),
+                    Path("/app/static/levels"),
+
+                    # Относительные пути от расположения скрипта
+                    Path(__file__).resolve().parent.parent.parent / "1bot_probuzhdenie" / "static" / "levels",
+                    Path(__file__).resolve().parent.parent / "static" / "levels",
+                ]
+
+                # Удаляем дубликаты и несуществующие пути
+                checked_paths = []
+                for path in possible_paths:
+                    try:
+                        path = path.resolve()
+                        if path not in checked_paths and path.exists():
+                            checked_paths.append(path)
+                    except Exception:
+                        continue
+
+                # Логируем все проверенные пути
+                logger.info(f"[Level {level_number}] Checking image paths:\n" +
+                            "\n".join(f" - {p}" for p in checked_paths))
+
+                # Ищем существующую папку
+                static_levels_dir = None
+                for path in checked_paths:
+                    if (path / image_relative).exists() or any(path.glob(image_relative + ".*")):
+                        static_levels_dir = path
+                        break
+
+                if not static_levels_dir:
+                    logger.error(f"[Level {level_number}] No valid images directory found")
+                    logger.info(f"[Level {level_number}] Checked paths:\n" +
+                                "\n".join(f" - {p}" for p in checked_paths))
+                    raise FileNotFoundError("No valid images directory found")
+
+                logger.info(f"[Level {level_number}] Using images dir: {static_levels_dir}")
+
+                # Полный путь к изображению
+                image_path = None
+                extensions = ['', '.jpg', '.jpeg', '.png', '.gif']
+
+                for ext in extensions:
+                    test_path = static_levels_dir / f"{image_relative}{ext}"
+                    if test_path.exists():
+                        image_path = test_path
+                        break
+
+                if not image_path:
+                    logger.error(
+                        f"[Level {level_number}] Image not found. Tried: {image_relative} with extensions {extensions}")
+                    logger.info(f"[Level {level_number}] Available files:\n" +
+                                "\n".join(f" - {f.name}" for f in static_levels_dir.glob('*')))
+                    raise FileNotFoundError("Image file not found")
+
+                # Отправка изображения
+                with open(image_path, 'rb') as photo:
+                    bot.send_photo(
+                        message.chat.id,
+                        photo,
+                        reply_markup=keyboard
+                    )
+                    logger.info(f"[Level {level_number}] Image successfully sent: {image_path}")
+
+            except Exception as e:
+                logger.error(f"[Level {level_number}] Error processing image: {str(e)}")
+                # Продолжаем работу даже если изображение не отправилось
+
+        # Обновляем состояние пользователя
         user_repo.set_user_state(user_id, BotStates.LEVEL_CONTENT)
-        logger.info(f"[Level Content] User state set to LEVEL_CONTENT")
+        logger.info(f"[Level {level_number}] User state set to LEVEL_CONTENT")
 
     except Exception as e:
-        logger.error(f"[Level Content] Error in show_level_content: {str(e)}", exc_info=True)
+        logger.error(f"[Level {level_number}] Error in show_level_content: {str(e)}", exc_info=True)
         bot.reply_to(message, "Произошла ошибка. Пожалуйста, попробуйте позже.")
 
 
@@ -374,22 +453,48 @@ def handle_start(message):
     try:
         user_id = message.from_user.id
         referrer_id = None
+        level = 1  # Уровень по умолчанию
 
+        # Обработка реферальной ссылки (только новый формат с уровнем)
         if len(message.text.split()) > 1 and message.text.split()[1].startswith('ref'):
             try:
-                referrer_id = int(message.text.split()[1][3:])
-                logger.info(f"Referral link detected. Referrer ID: {referrer_id}")
+                ref_part = message.text.split()[1][3:]  # ref7348673748_2 → 7348673748_2
 
-                if referrer_id != user_id:
-                    # Сначала создаем пользователя, если его нет
-                    user_repo.create_user(user_id)
+                # Разбираем ID реферера и уровень (только новый формат)
+                if "_" in ref_part:
+                    referrer_id = int(ref_part.split("_")[0])  # Берём часть до "_" (7348673748)
+                    level = int(ref_part.split("_")[1])  # Берём уровень (2)
+                else:
+                    logger.warning(f"Некорректный формат реферальной ссылки: {message.text}")
+                    raise ValueError("Некорректный формат ссылки")
 
-                    # Затем пробуем создать реферальную запись
-                    if not referral_repo.create_referral(referrer_id, user_id):
-                        logger.error("Failed to create referral record")
+                logger.info(f"Реферальная ссылка: referrer_id={referrer_id}, level={level}")
+
+                # Проверки перед созданием реферальной связи
+                if referrer_id == user_id:
+                    logger.warning("Пользователь попытался пригласить себя")
+                else:
+                    # Проверяем что пользователь новый
+                    existing_user = user_repo.get_user(user_id)
+                    if existing_user and existing_user.get('registration_complete'):
+                        logger.info(f"Пользователь {user_id} уже зарегистрирован")
+                    else:
+                        # Проверяем что уровень в ссылке выше текущего уровня реферера
+                        referrer = user_repo.get_user(referrer_id)
+                        if referrer and level > referrer.get('current_level', 1):
+                            logger.warning(
+                                f"Уровень {level} превышает уровень реферера {referrer.get('current_level', 1)}")
+                            bot.send_message(user_id, "❌ Уровень в ссылке недействителен")
+                            return
+                        else:
+                            user_repo.create_user(user_id)
+                            if not referral_repo.create_referral(referrer_id, user_id, level):
+                                logger.error("Ошибка при создании реферальной записи")
+
             except (ValueError, IndexError) as e:
-                logger.error(f"Error parsing referral link: {e}")
+                logger.error(f"Ошибка обработки реферальной ссылки: {e}")
 
+        # Создаём/обновляем пользователя
         user_repo.create_user(user_id)
         user = user_repo.get_user(user_id)
 
@@ -657,35 +762,55 @@ def start_game(message):
 
 
 @bot.message_handler(func=lambda message: message.text == "Ответы на вопросы" and
-                                          user_repo.get_user_state(message.from_user.id) == BotStates.LEVEL_CONTENT)
+                                      user_repo.get_user_state(message.from_user.id) == BotStates.LEVEL_CONTENT)
 def show_faq(message):
+    """Обработчик раздела 'Ответы на вопросы' с возвратом на 1 уровень"""
     try:
-        faq_text = (
-            "Часто задаваемые вопросы:\n\n"
-            "1. Что такое душа человека?\n"
-            "Душа — это нематериальная суть человека, которую многие считают источником сознания,"
-            "чувств, совести и личности.\n\n"
-            "2. Существует ли душа после смерти?\n"
-            "Это вопрос веры и мировоззрения.\n\n"
-            "3. Можно ли почувствовать душу?\n"
-            "Многие люди описывают ощущение душевной теплоты, интуиции или внутреннего голоса\n\n "
-            "4. Откуда берётся душа?\n"
-            "Наука пока не может ответить на этот вопрос.\n\n"
-            "5. Можно ли “испортить” или “очистить” душу?\n"
-            "Да, в большинстве культур и религий душа может загрязниться плохими поступками, "
-            "злобой, завистью, ложью.\n\n"
+        user_id = message.from_user.id
+        logger.info(f"User {user_id} opened FAQ")
 
-        )
+        # Форматированный текст FAQ
+        faq_text = """
+<b>Часто задаваемые вопросы:</b>
+
+1. <i>Что такое душа человека?</i>
+Душа — нематериальная суть человека, источник сознания и личности.
+
+2. <i>Существует ли душа после смерти?</i>
+Это вопрос веры и мировоззрения.
+
+3. <i>Можно ли почувствовать душу?</i>
+Многие описывают ощущение душевной теплоты или внутреннего голоса.
+
+4. <i>Откуда берётся душа?</i>
+Наука не может ответить, религии предлагают различные теории.
+
+5. <i>Как очистить душу?</i>
+Добрые дела, медитация и духовные практики помогают душе.
+"""
+
+        # Клавиатура только с кнопкой Назад
+        keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        keyboard.add(types.KeyboardButton("Назад"))
 
         bot.send_message(
             message.chat.id,
             faq_text,
+            parse_mode='HTML',
+            reply_markup=keyboard
+        )
+
+        # Устанавливаем состояние FAQ
+        user_repo.set_user_state(user_id, BotStates.FAQ)
+        logger.info(f"User {user_id} state set to FAQ")
+
+    except Exception as e:
+        logger.error(f"FAQ error for user {user_id}: {str(e)}")
+        bot.send_message(
+            message.chat.id,
+            "⚠️ Ошибка загрузки FAQ",
             reply_markup=create_back_keyboard()
         )
-    except Exception as e:
-        logger.error(f"Error in show_faq: {e}")
-        bot.reply_to(message, "Произошла ошибка. Пожалуйста, попробуйте позже.")
-
 
 @bot.message_handler(func=lambda message: message.text == "Далее, перейти к следующему уровню." and
                                           user_repo.get_user_state(message.from_user.id) == BotStates.LEVEL_CONTENT)
@@ -873,6 +998,7 @@ def start_time_task(message):
 @bot.message_handler(func=lambda message: message.text == "Задание выполнено" and
                                           user_repo.get_user_state(message.from_user.id) == BotStates.TIME_TASK)
 def complete_time_task(message):
+    """Обработчик завершения задания на время с отображением контента и изображения уровня"""
     try:
         user_id = message.from_user.id
         user = user_repo.get_user(user_id)
@@ -914,18 +1040,63 @@ def complete_time_task(message):
         if next_level <= MAX_LEVEL:
             user_repo.update_user_level(user_id, next_level)
 
-            # 3. Показываем контент нового уровня
-            show_level_content(message, next_level)
+            # 3. Получаем данные нового уровня
+            level_content = level_repo.get_level_content(next_level)
+            level_rules = level_repo.get_level_rules(next_level)
+            keyboard = create_level_navigation_keyboard(
+                next_level,
+                user_id=user_id,
+                task_repo=task_repo
+            )
 
-            # 4. Отправляем уведомление о выполнении
+            # 4. Отправляем контент уровня
+            if level_content:
+                bot.send_message(
+                    message.chat.id,
+                    level_content,
+                    reply_markup=keyboard
+                )
+
+                # 5. Отправляем изображение уровня, если указано
+                if level_rules and level_rules.startswith("image:"):
+                    try:
+                        import os
+                        from pathlib import Path
+
+                        image_relative = level_rules.replace("image:", "").strip()
+
+                        # Проверяем все возможные пути к изображениям
+                        possible_paths = [
+                            Path(r"C:\projects\1bot_probuzhdenie\static\levels"),
+                            Path(r"C:\1bot_probuzhdenie\static\levels"),
+                            Path(r"C:\static\levels"),
+                            Path(r"C:\app\static\levels"),
+                            Path("/var/www/1bot_probuzhdenie/static/levels"),
+                            Path("/app/static/levels"),
+                            Path(__file__).resolve().parent.parent.parent / "1bot_probuzhdenie" / "static" / "levels",
+                            Path(__file__).resolve().parent.parent / "static" / "levels",
+                        ]
+
+                        # Ищем существующий файл изображения
+                        for path in possible_paths:
+                            for ext in ['', '.jpg', '.jpeg', '.png', '.gif']:
+                                image_path = path / f"{image_relative}{ext}"
+                                if image_path.exists():
+                                    with open(image_path, 'rb') as photo:
+                                        bot.send_photo(
+                                            message.chat.id,
+                                            photo,
+                                            reply_markup=keyboard
+                                        )
+                                    break
+                    except Exception as e:
+                        logger.error(f"[Level {next_level}] Error sending image: {str(e)}")
+
+            # 6. Отправляем уведомление о выполнении
             bot.send_message(
                 message.chat.id,
                 f"✅ Задание на время выполнено! Открыт {next_level} уровень",
-                reply_markup=create_level_navigation_keyboard(
-                    next_level,
-                    user_id=user_id,
-                    task_repo=task_repo
-                )
+                reply_markup=keyboard
             )
         else:
             # Обработка максимального уровня
@@ -942,111 +1113,149 @@ def complete_time_task(message):
                                           user_repo.get_user_state(message.from_user.id) == BotStates.TASK_SELECTION)
 def handle_referral_task(message):
     try:
-        user = user_repo.get_user(message.from_user.id)
-        current_level = user.get('current_level', 1)
-
-        referral_link = f"https://t.me/Sovmestimost_par_bot?start=ref{message.from_user.id}"
-
-        referral_text = (
-            "Пригласите друга в игру по этой ссылке:\n\n"
-            f"{referral_link}\n\n"
-            "После вступления в бота, откроется следующий уровень."
-        )
-
-        keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-        keyboard.add(types.KeyboardButton("Проверить статус"))
-        keyboard.add(types.KeyboardButton("Назад"))
-
-        bot.send_message(
-            message.chat.id,
-            referral_text,
-            reply_markup=keyboard
-        )
-
-        user_repo.set_user_state(message.from_user.id, BotStates.REFERRAL_TASK)
-    except Exception as e:
-        logger.error(f"Error in handle_referral_task: {e}")
-        bot.reply_to(message, "Произошла ошибка. Пожалуйста, попробуйте позже.")
-
-
-def check_referral_status(message):
-    try:
         user_id = message.from_user.id
         user = user_repo.get_user(user_id)
         current_level = user.get('current_level', 1)
 
-        # 1. Проверяем статус рефералов
-        referral_status = referral_repo.get_referral_status(user_id, current_level)
-
-        if referral_status['error']:
-            bot.send_message(
-                message.chat.id,
-                "Произошла ошибка при проверке статуса рефералов. Пожалуйста, попробуйте позже."
-            )
-            return
-
-        if referral_status['completed_referrals'] > 0:
-            # 2. Создаем выполненное задание
-            task_repo.create_task(
+        # 1. Сначала создаем запись задания (если еще не существует)
+        if not task_repo.is_task_completed(user_id, current_level, 'referral'):
+            task_created = task_repo.create_task(
                 user_id=user_id,
                 level=current_level,
                 task_type='referral',
                 start_time=datetime.now(),
-                end_time=datetime.now(),
-                completed=True
+                end_time=datetime.now() + timedelta(days=30),  # Например, 30 дней на выполнение
+                completed=False
             )
+            if not task_created:
+                logger.error(f"Failed to create referral task for user {user_id}")
 
-            # 3. Обновляем уровень пользователя
-            next_level = current_level + 1
-            if next_level <= MAX_LEVEL:
-                user_repo.update_user_level(user_id, next_level)
+        # 2. Генерация реферальной ссылки
+        referral_link = f"https://t.me/Sovmestimost_par_bot?start=ref{user_id}_{current_level}"  # Добавляем уровень в ссылку
 
-                # 4. Показываем контент нового уровня
-                show_level_content(message, next_level)
-
-                # 5. Отправляем уведомление о выполнении
-                bot.send_message(
-                    message.chat.id,
-                    f"✅ Реферальное задание выполнено! Приглашено: {referral_status['completed_referrals']}\n"
-                    f"Открыт {next_level} уровень",
-                    reply_markup=create_level_navigation_keyboard(
-                        next_level,
-                        user_id=user_id,
-                        task_repo=task_repo
-                    )
-                )
-            else:
-                # Обработка максимального уровня
-                show_final_level_message(message)
-
-            user_repo.set_user_state(user_id, BotStates.LEVEL_CONTENT)
-        else:
-            # Оригинальная логика при незавершенном задании
-            response = (
-                "❌ Ваш друг ещё не зарегистрировался.\n"
-                f"Всего приглашено: {referral_status['total_referrals']}\n"
-                "Продолжайте приглашать друзей!"
-            )
-
-            markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-            markup.add(
-                types.KeyboardButton("Проверить статус"),
+        bot.send_message(
+            message.chat.id,
+            f"Пригласите друга по ссылке:\n\n{referral_link}\n\n"
+            "После регистрации друга задание будет выполнено автоматически.",
+            reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add(
+                types.KeyboardButton("Проверить статус задания"),
                 types.KeyboardButton("Назад")
             )
+        )
+        user_repo.set_user_state(user_id, BotStates.REFERRAL_TASK)
 
+    except Exception as e:
+        logger.error(f"Error in handle_referral_task: {str(e)}")
+        bot.reply_to(message, "Произошла ошибка. Попробуйте позже.")
+
+
+@bot.message_handler(func=lambda message: message.text.strip() == "Проверить статус задания")
+def handle_check_referral_status(message):
+    """Улучшенный обработчик проверки статуса реферального задания"""
+    try:
+        from telebot import types  # Импортируем types для создания клавиатуры
+
+        user_id = message.from_user.id
+        logger.info(f"Проверка реферального задания для user_id={user_id}")
+
+        # Получаем данные пользователя
+        user = user_repo.get_user(user_id)
+        if not user:
+            logger.error(f"Пользователь {user_id} не найден")
+            bot.send_message(user_id, "❌ Ошибка: ваш профиль не найден")
+            return
+
+        current_level = user.get('current_level', 1)
+        logger.debug(f"Текущий уровень пользователя: {current_level}")
+
+        # Создаем клавиатуру с кнопкой "Назад" прямо в обработчике
+        back_markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        back_markup.add(types.KeyboardButton("Назад"))
+
+        # Проверяем выполненные реферальные задания
+        try:
+            # 1. Получаем актуальное количество завершенных рефералов
+            completed_refs = referral_repo.get_completed_referrals_count(
+                user_id,
+                current_level
+            )
+            logger.info(f"Найдено завершенных рефералов: {completed_refs}")
+
+            # 2. Проверяем выполнение условия
+            REQUIRED_REFERRALS = 1
+            if completed_refs >= REQUIRED_REFERRALS:
+                # Создаем запись о выполнении задания, если ее нет
+                if not task_repo.is_task_completed(user_id, current_level, 'referral'):
+                    task_repo.create_task(
+                        user_id=user_id,
+                        level=current_level,
+                        task_type='referral',
+                        completed=True
+                    )
+                    logger.info(f"Задание уровня {current_level} отмечено как выполненное")
+
+                # Обновляем прогресс пользователя
+                next_level = min(current_level + 1, MAX_LEVEL)
+                user_repo.update_user_level(user_id, next_level)
+                user_repo.set_user_state(user_id, BotStates.LEVEL_CONTENT)
+
+                # Отправляем сообщение об успехе
+                bot.send_message(
+                    user_id,
+                    f"✅ Реферальное задание уровня {current_level} выполнено!\n\n"
+                    f"🎉 Открыт уровень {next_level}!",
+                    reply_markup=create_level_navigation_keyboard(next_level, user_id, task_repo)
+                )
+
+                # Показываем контент нового уровня
+                show_level_content(message, next_level)
+            else:
+                # Показываем статус, если задание не выполнено
+                bot.send_message(
+                    user_id,
+                    f"⏳ Задание не выполнено. Завершено {completed_refs}/{REQUIRED_REFERRALS} рефералов.",
+                    reply_markup=back_markup  # Используем созданную здесь клавиатуру
+                )
+
+        except Exception as e:
+            logger.error(f"Ошибка проверки рефералов: {str(e)}")
             bot.send_message(
-                message.chat.id,
-                response,
-                reply_markup=markup
+                user_id,
+                "⚠️ Ошибка при проверке статуса задания. Попробуйте позже.",
+                reply_markup=back_markup
             )
 
     except Exception as e:
-        logger.error(f"Error in check_referral_status: {str(e)}", exc_info=True)
-        bot.reply_to(
-            message,
-            "Произошла непредвиденная ошибка при проверке статуса. "
-            "Администратор уже уведомлен. Пожалуйста, попробуйте позже."
+        logger.critical(f"Критическая ошибка: {str(e)}", exc_info=True)
+        bot.send_message(
+            user_id,
+            "⚠️ Произошла непредвиденная ошибка. Мы уже работаем над исправлением.",
+            reply_markup=create_main_menu_keyboard()
         )
+
+
+def show_pending_referral_status(user_id, level, stats):
+    """Отображение статуса незавершенного задания"""
+    try:
+        response = f"""
+        📊 Прогресс реферального задания (уровень {level}):
+
+        👥 Всего на уровне {level} приглашено новых пользователей: {stats['total']}
+        ✅ Из них завершили регистрацию: {stats['completed']}
+        
+
+        Для перехода на следующий уровень необходимо,
+        чтобы 1 человек завершил регистрацию.
+        """
+
+        keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        keyboard.add(types.KeyboardButton("Назад"))
+
+
+        bot.send_message(user_id, response, reply_markup=keyboard)
+    except Exception as e:
+        logger.error(f"Ошибка отображения статуса: {str(e)}")
+        raise
 
 
 @bot.message_handler(func=lambda message: message.text == "Донат" and
@@ -1338,28 +1547,42 @@ def show_task_status_details(message, current_level):
         logger.error(f"Error in show_task_status_details: {str(e)}")
         bot.reply_to(message, "Произошла ошибка. Пожалуйста, попробуйте позже.")
 
-
-@bot.message_handler(func=lambda message: message.text == "Назад")
+@bot.message_handler(func=lambda message: message.text.strip() in ["⬅️ Назад", "Назад", "Back", "⬅️ К уровням"])
 def handle_back(message):
-    """Обработчик кнопки 'Назад' с учетом просматриваемого уровня"""
+    """Улучшенный обработчик кнопки 'Назад' с учетом всех состояний"""
     try:
         user_id = message.from_user.id
-        viewed_level = user_data_repo.get_viewed_level(user_id)
+        current_state = user_repo.get_user_state(user_id)
+        logger.info(f"[Back] User {user_id} pressed back. Current state: {current_state}")
 
-        logger.info(f"[Back Button] User {user_id} pressed 'Назад'. Current viewed level: {viewed_level}")
+        # Обработка специальных состояний в приоритетном порядке
+        if current_state == BotStates.CHARITY_AMOUNT_INPUT:
+            show_level_content(message, 21)  # Возврат из благотворительности на 21 уровень
+            return
 
-        if viewed_level > 1:
-            new_level = viewed_level - 1
-            logger.info(f"[Back Button] Moving back to level {new_level}")
-            show_level_content(message, new_level)
+        if current_state == BotStates.FAQ:
+            show_level_content(message, 1)  # Возврат из FAQ на 1 уровень
+            return
+
+        # Получаем информацию о пользователе
+        user = user_repo.get_user(user_id)
+        current_level = user.get('current_level', 1)
+        viewed_level = user_data_repo.get_viewed_level(user_id) or current_level
+
+        # Обработка состояний, связанных с уровнями
+        if current_state in [BotStates.LEVEL_CONTENT, BotStates.TASK_SELECTION,
+                           BotStates.TIME_TASK, BotStates.REFERRAL_TASK,
+                           BotStates.DONATION_TASK]:
+            show_level_content(message, viewed_level)
+        elif current_state == BotStates.FINAL_LEVEL:
+            show_level_content(message, 21)  # Возврат из финального уровня
         else:
-            logger.info("[Back Button] Already at level 1, showing main menu")
+            # Для всех остальных состояний - главное меню
             show_main_menu(message)
 
     except Exception as e:
-        logger.error(f"[Back Button] Error: {str(e)}", exc_info=True)
+        logger.error(f"[Back] Error: {str(e)}", exc_info=True)
         bot.reply_to(message, "Произошла ошибка. Пожалуйста, попробуйте позже.")
-
 
 def show_main_menu(message):
     try:
@@ -1448,110 +1671,176 @@ CHARITY_AMOUNT_INPUT = 100
 
 @bot.message_handler(func=lambda message: message.text == "Благотворительность")
 def handle_charity(message):
-    msg = bot.send_message(
-        message.chat.id,
-        "Введите сумму благотворительного пожертвования (в рублях):",
-        reply_markup=types.ReplyKeyboardRemove()
-    )
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.add(
-        types.KeyboardButton("Назад"),
-    )
-    bot.register_next_step_handler(msg, process_charity_amount)
+    try:
+        user_id = message.from_user.id
+        user_repo.set_user_state(user_id, BotStates.CHARITY_AMOUNT_INPUT)  # Устанавливаем состояние 12
+
+        # Клавиатура с кнопкой возврата
+        keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        keyboard.add(types.KeyboardButton("21 уровень"))
+
+        msg = bot.send_message(
+            message.chat.id,
+            "Введите сумму благотворительного пожертвования (в рублях):",
+            reply_markup=keyboard
+        )
+
+        bot.register_next_step_handler(msg, process_charity_amount_or_back)
+
+    except Exception as e:
+        logger.error(f"Ошибка в handle_charity: {str(e)}")
+        bot.send_message(
+            message.chat.id,
+            "Произошла ошибка. Пожалуйста, попробуйте позже.",
+            reply_markup=create_level_navigation_keyboard(21, message.from_user.id, task_repo)
+        )
 
 
 def process_charity_amount(message):
     try:
-        amount = float(message.text.replace(',', '.'))
-        if amount < 1:
-            bot.send_message(message.chat.id, "Минимальная сумма - 1 рубль")
+        user_id = message.from_user.id
+
+        # Проверяем, что введено число
+        try:
+            amount = float(message.text.replace(',', '.'))
+            if amount <= 0:
+                raise ValueError("Сумма должна быть положительной")
+        except ValueError:
+            bot.send_message(
+                message.chat.id,
+                "⚠️ Пожалуйста, введите корректную сумму в рублях (например: 100 или 100.50)",
+                reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("21 уровень")
+            )
             return
 
-        user_repo.set_user_state(message.from_user.id, CHARITY_AMOUNT_INPUT)
+        # Создаем платеж в ЮKassa
+        payment_url = create_charity_payment(user_id, amount)
 
-        payment_url = create_charity_payment(
-            user_id=message.from_user.id,
-            amount=amount
+        if not payment_url:
+            bot.send_message(
+                message.chat.id,
+                "❌ Не удалось создать платеж. Пожалуйста, попробуйте позже.",
+                reply_markup=create_level_navigation_keyboard(21, user_id, task_repo)
+            )
+            return
+
+        # Отправляем сообщение с кнопкой оплаты
+        bot.send_message(
+            message.chat.id,
+            f"💳 Сумма пожертвования: {amount:.2f} руб.\n\n"
+            "Для оплаты нажмите кнопку ниже:",
+            reply_markup=types.InlineKeyboardMarkup().add(
+                types.InlineKeyboardButton("Оплатить", url=payment_url)
+            )
         )
 
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton(
-            text="Оплатить",
-            url=payment_url
-        ))
-
-        reply_markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-        reply_markup.add(types.KeyboardButton("Проверить статус пожертвования"))
+        # Клавиатура с кнопками управления
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        markup.row(types.KeyboardButton("Проверить статус пожертвования"))
+        markup.row(types.KeyboardButton("21 уровень"))
 
         bot.send_message(
             message.chat.id,
-            f"Сумма пожертвования: {amount} руб.\nНажмите кнопку ниже для оплаты:",
+            "После оплаты вы можете проверить статус пожертвования",
             reply_markup=markup
         )
+
+        # Обновляем состояние пользователя
+        user_repo.set_user_state(user_id, BotStates.CHARITY_AMOUNT_INPUT)
+
+    except Exception as e:
+        logger.error(f"Ошибка в process_charity_amount: {str(e)}", exc_info=True)
         bot.send_message(
             message.chat.id,
-            "После оплаты нажмите 'Проверить статус пожертвования'",
-            reply_markup=reply_markup
+            "⚠️ Произошла ошибка при обработке платежа. Пожалуйста, попробуйте позже.",
+            reply_markup=create_level_navigation_keyboard(21, message.from_user.id, task_repo)
         )
 
-    except ValueError:
-        bot.send_message(message.chat.id, "Пожалуйста, введите корректную сумму")
-    except Exception as e:
-        logger.error(f"Charity error: {str(e)}")
-        bot.send_message(message.chat.id, "Произошла ошибка, попробуйте позже")
+def process_charity_amount_or_back(message):
+    if message.text.strip() == "21 уровень":
+        show_level_content(message, 21)
+        return
+    process_charity_amount(message)
 
 
 @bot.message_handler(func=lambda message: message.text == "Проверить статус пожертвования")
 def check_charity_status(message):
     try:
         user_id = message.from_user.id
-        donation = donation_repo.get_last_donation(user_id, level=0)
+        logger.info(f"Проверка статуса пожертвования для {user_id}")
 
+        # Принудительно устанавливаем нужное состояние
+        user_repo.set_user_state(user_id, BotStates.CHARITY_AMOUNT_INPUT)
+
+        donation = donation_repo.get_last_donation(user_id, level=0)
         if not donation:
-            bot.send_message(message.chat.id, "Пожертвование не найдено",
-                             reply_markup=create_back_keyboard())
+            bot.send_message(
+                message.chat.id,
+                "❌ Пожертвование не найдено",
+                reply_markup=create_level_navigation_keyboard(21, user_id, task_repo)
+            )
             return
 
-        payment_id = donation['payment_id']
-        payment = Payment.find_one(payment_id)
-
-        if payment.status == 'succeeded':
-            donation_repo.update_donation_status(
-                donation_id=donation['id'],
-                status='succeeded',
-                payment_id=payment_id
-            )
-
-            # Используем стандартное главное меню вместо кастомной клавиатуры
-            user_repo.set_user_state(user_id, BotStates.MAIN_MENU)
-            show_main_menu(message)  # Используем существующую функцию для показа меню
-
+        payment_id = donation.get('payment_id')
+        if not payment_id:
             bot.send_message(
                 message.chat.id,
-                "✅ Пожертвование успешно получено! Спасибо за вашу поддержку!"
+                "⚠️ Ошибка: отсутствует идентификатор платежа",
+                reply_markup=create_level_navigation_keyboard(21, user_id, task_repo)
             )
-        elif payment.status == 'pending':
-            markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-            markup.add(types.KeyboardButton("Проверить статус пожертвования"))
+            return
+
+        try:
+            payment = Payment.find_one(payment_id)
+
+            if payment.status == 'succeeded':
+                donation_repo.update_donation_status(
+                    donation_id=donation['id'],
+                    status='succeeded',
+                    payment_id=payment_id,
+                    processed=True
+                )
+
+                bot.send_message(
+                    message.chat.id,
+                    "✅ Пожертвование успешно получено! Спасибо за вашу поддержку!",
+                    reply_markup=create_level_navigation_keyboard(21, user_id, task_repo)
+                )
+
+            elif payment.status == 'pending':
+                markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+                markup.row(types.KeyboardButton("Проверить статус пожертвования"))
+                markup.row(types.KeyboardButton("21 уровень"))
+
+                bot.send_message(
+                    message.chat.id,
+                    "⏳ Платеж ожидает оплаты",
+                    reply_markup=markup
+                )
+
+            else:
+                bot.send_message(
+                    message.chat.id,
+                    f"ℹ️ Статус платежа: {payment.status}",
+                    reply_markup=create_level_navigation_keyboard(21, user_id, task_repo)
+                )
+
+        except Exception as e:
+            logger.error(f"Ошибка проверки платежа: {str(e)}")
             bot.send_message(
                 message.chat.id,
-                "⏳ Платеж ожидает оплаты",
-                reply_markup=markup
-            )
-        else:
-            bot.send_message(
-                message.chat.id,
-                f"Статус платежа: {payment.status}",
-                reply_markup=create_back_keyboard()
+                "⚠️ Ошибка при проверке статуса платежа",
+                reply_markup=create_level_navigation_keyboard(21, user_id, task_repo)
             )
 
     except Exception as e:
-        logger.error(f"Charity status check error: {str(e)}")
+        logger.error(f"Ошибка в check_charity_status: {str(e)}")
         bot.send_message(
             message.chat.id,
-            "Ошибка при проверке статуса",
-            reply_markup=create_back_keyboard()
+            "⚠️ Произошла ошибка. Пожалуйста, попробуйте позже.",
+            reply_markup=create_level_navigation_keyboard(21, message.from_user.id, task_repo)
         )
+
 
 
 @bot.message_handler(func=lambda message: True)
@@ -1616,7 +1905,9 @@ def payment_poller():
                         user_repo.update_user_level(payment['user_id'], next_level)
                         user_repo.set_user_state(payment['user_id'], BotStates.LEVEL_CONTENT)
 
+                        # Получаем контент и правила уровня
                         level_content = level_repo.get_level_content(next_level)
+                        level_rules = level_repo.get_level_rules(next_level)
                         keyboard = create_level_navigation_keyboard(
                             next_level,
                             user_id=payment['user_id'],
@@ -1624,11 +1915,66 @@ def payment_poller():
                         )
 
                         if level_content:
+                            # Отправка контента уровня
                             bot.send_message(
                                 payment['user_id'],
                                 level_content,
                                 reply_markup=keyboard
                             )
+
+                            # Отправка изображения уровня, если указано
+                            if level_rules and level_rules.startswith("image:"):
+                                try:
+                                    import os
+                                    from pathlib import Path
+
+                                    # Получаем относительный путь из БД
+                                    image_relative = level_rules.replace("image:", "").strip()
+
+                                    # Все возможные пути к папке с изображениями
+                                    possible_paths = [
+                                        Path(r"C:\projects\1bot_probuzhdenie\static\levels"),
+                                        Path(r"C:\1bot_probuzhdenie\static\levels"),
+                                        Path(r"C:\static\levels"),
+                                        Path(r"C:\app\static\levels"),
+                                        Path("/var/www/1bot_probuzhdenie/static/levels"),
+                                        Path("/app/static/levels"),
+                                        Path(
+                                            __file__).resolve().parent.parent.parent / "1bot_probuzhdenie" / "static" / "levels",
+                                        Path(__file__).resolve().parent.parent / "static" / "levels",
+                                    ]
+
+                                    # Ищем существующую папку
+                                    static_levels_dir = None
+                                    for path in possible_paths:
+                                        try:
+                                            if path.exists():
+                                                static_levels_dir = path
+                                                break
+                                        except Exception:
+                                            continue
+
+                                    if static_levels_dir:
+                                        # Проверяем существование файла
+                                        image_path = None
+                                        extensions = ['', '.jpg', '.jpeg', '.png', '.gif']
+
+                                        for ext in extensions:
+                                            test_path = static_levels_dir / f"{image_relative}{ext}"
+                                            if test_path.exists():
+                                                image_path = test_path
+                                                break
+
+                                        if image_path:
+                                            with open(image_path, 'rb') as photo:
+                                                bot.send_photo(
+                                                    payment['user_id'],
+                                                    photo,
+                                                    reply_markup=keyboard
+                                                )
+                                                logger.info(f"[Payment Poller] Sent image for level {next_level}")
+                                except Exception as e:
+                                    logger.error(f"[Payment Poller] Error sending image: {str(e)}")
 
                         bot.send_message(
                             payment['user_id'],
@@ -1652,6 +1998,7 @@ def payment_poller():
             logger.error(f"Payment poller error: {e}")
 
         time.sleep(60)
+
 
 def run_bot():
     logger.info("Starting bot...")
