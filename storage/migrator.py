@@ -121,13 +121,11 @@ class Migrator:
                     cursor.execute(query)
                     conn.commit()
 
-                # 4. Удаление старого триггера (если существует)
                 cursor.execute("""
                     DROP TRIGGER IF EXISTS after_user_registration ON users
                 """)
                 conn.commit()
 
-                # 5. Создание улучшенной триггерной функции
                 cursor.execute("""
                     CREATE OR REPLACE FUNCTION process_referral_registration()
                     RETURNS TRIGGER AS $$
@@ -182,7 +180,6 @@ class Migrator:
                 """)
                 conn.commit()
 
-                # 6. Создание триггера
                 cursor.execute("""
                     CREATE TRIGGER after_user_registration
                     AFTER UPDATE OF registration_complete ON users
@@ -193,7 +190,6 @@ class Migrator:
                 """)
                 conn.commit()
 
-                # 7. Создание таблицы для логов (если не существует)
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS audit_log (
                         id SERIAL PRIMARY KEY,
@@ -207,7 +203,6 @@ class Migrator:
                 """)
                 conn.commit()
 
-                # 8. Исправление "зависших" реферальных заданий
                 cursor.execute("""
                     UPDATE tasks t
                     SET 

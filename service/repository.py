@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # Базовый класс BaseRepository
 # Базовый класс для всех репозиториев, содержащий общую логику:
 # Принимает экземпляр PostgresStorage для работы с базой данных
-# Предоставляет доступ к соединению через self.storage.connection()
+# Предоставляет доступ к соединению через self.storage.connection().
 class BaseRepository:
     def __init__(self, storage: PostgresStorage):
         self.storage = storage

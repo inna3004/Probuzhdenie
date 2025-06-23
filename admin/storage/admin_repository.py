@@ -2,7 +2,7 @@ import logging
 from typing import Dict, List, Optional
 from datetime import datetime
 from storage.postgres_storage import PostgresStorage
-from settings import ADMIN_IDS  # Добавим в settings.py
+from settings import ADMIN_IDS
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,6 @@ class AdminRepository:
         with self.storage.connection() as conn:
             cursor = conn.cursor()
             try:
-                # Считаем пользователей, которые начали игру (не только что зарегистрировались)
                 cursor.execute(
                     """SELECT COUNT(*) FROM users 
                     WHERE current_level > 1 OR registration_complete = TRUE"""
@@ -43,7 +42,6 @@ class AdminRepository:
         with self.storage.connection() as conn:
             cursor = conn.cursor()
             try:
-                # Считаем все выполненные задания (кроме донатов)
                 cursor.execute(
                     """SELECT COUNT(*) FROM tasks 
                     WHERE completed = TRUE AND task_type != 'donation'"""
